@@ -114,7 +114,9 @@ export function computeKpis(rows) {
 }
 
 // Incidents per day / week / month, picked by how long the window is.
-export function trendSeries(rows) {
+// Optional `groups` ([{ match: (row) => boolean }]) adds per-group counts as
+// s0, s1, ... on every data point (used by the comparison chart).
+export function trendSeries(rows, groups = []) {
   if (!rows.length) return { granularity: "day", data: [] };
 
   const perDay = new Map();
@@ -122,7 +124,15 @@ export function trendSeries(rows) {
   let max = -Infinity;
   for (const r of rows) {
     const k = dayKey(r.date_time);
-    perDay.set(k, (perDay.get(k) || 0) + 1);
+    let e = perDay.get(k);
+    if (!e) {
+      e = { n: 0, g: Array(groups.length).fill(0) };
+      perDay.set(k, e);
+    }
+    e.n++;
+    groups.forEach((g, i) => {
+      if (g.match(r)) e.g[i]++;
+    });
     const t = utcMs(k);
     if (t < min) min = t;
     if (t > max) max = t;
@@ -145,16 +155,23 @@ export function trendSeries(rows) {
   };
 
   const buckets = new Map();
-  for (const [k, c] of perDay) {
+  for (const [k, e] of perDay) {
     const b = startOf(utcMs(k));
-    buckets.set(b, (buckets.get(b) || 0) + c);
+    let cur = buckets.get(b);
+    if (!cur) {
+      cur = { n: 0, g: Array(groups.length).fill(0) };
+      buckets.set(b, cur);
+    }
+    cur.n += e.n;
+    e.g.forEach((c, i) => (cur.g[i] += c));
   }
 
   const data = [];
   for (let b = startOf(min); b <= max; b = next(b)) {
     const d = new Date(b);
     const yr = d.getUTCFullYear();
-    data.push({
+    const cur = buckets.get(b);
+    const point = {
       label: granularity === "month" ? `${MONTHS[d.getUTCMonth()]} '${String(yr).slice(2)}` : fmtDay(b),
       full:
         granularity === "day"
@@ -162,8 +179,10 @@ export function trendSeries(rows) {
           : granularity === "week"
             ? `Week of ${fmtDay(b)}, ${yr}`
             : `${MONTHS[d.getUTCMonth()]} ${yr}`,
-      count: buckets.get(b) || 0,
-    });
+      count: cur?.n || 0,
+    };
+    groups.forEach((_, i) => (point[`s${i}`] = cur?.g[i] || 0));
+    data.push(point);
   }
   return { granularity, data };
 }
@@ -184,4 +203,38 @@ export function weekdaySeries(rows) {
   const counts = Array(7).fill(0);
   for (const r of rows) counts[(new Date(utcMs(dayKey(r.date_time))).getUTCDay() + 6) % 7]++;
   return counts.map((count, i) => ({ label: DAY_NAMES[i], full: DAY_NAMES[i], count }));
+}
+
+// ---- colours shared by the legend, comparison chart and bar lists ----
+export const SERIES_COLORS = [
+  "#15803d", "#2563eb", "#d97706", "#7c3aed",
+  "#dc2626", "#0891b2", "#db2777", "#65a30d",
+];
+
+// ---- CSV export ----
+export function toCsv(rows) {
+  const derived = new Set(["streets", "offence"]);
+  const cols = ["date_time", "type", "subtype", "category", "location"];
+  for (const r of rows) {
+    for (const k of Object.keys(r)) if (!derived.has(k) && !cols.includes(k)) cols.push(k);
+  }
+  const cell = (v) => {
+    const t = v == null ? "" : String(v);
+    return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  const lines = [cols.join(",")];
+  for (const r of rows) lines.push(cols.map((c) => cell(r[c])).join(","));
+  return "\uFEFF" + lines.join("\r\n"); // BOM so Excel reads UTF-8 correctly
+}
+
+export function downloadCsv(rows, filename) {
+  const blob = new Blob([toCsv(rows)], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RANGES, fetchRange } from "./api.js";
 import {
+  SERIES_COLORS,
   computeKpis,
   daysSince,
   enrich,
@@ -13,9 +14,14 @@ import {
   weekdaySeries,
 } from "./utils.js";
 import Kpis from "./components/Kpis.jsx";
-import { BarList, ColumnChart, TrendChart } from "./components/Charts.jsx";
+import { ColumnChart, TrendChart } from "./components/Charts.jsx";
+import MultiSelect from "./components/MultiSelect.jsx";
+import DataTable from "./components/DataTable.jsx";
+import { CompareChart, FilterChips, MultiBarList } from "./components/Compare.jsx";
+import "./components.css";
 
 const CACHE_MS = 60_000;
+const MAX_COMPARE = SERIES_COLORS.length;
 const REFRESH_OPTIONS = [
   { value: 0, label: "Off" },
   { value: 5, label: "Every 5 s" },
@@ -27,8 +33,8 @@ const GRANULARITY_LABEL = { day: "per day", week: "per week", month: "per month"
 
 export default function App() {
   const [range, setRange] = useState("all");
-  const [location, setLocation] = useState("all");
-  const [category, setCategory] = useState("all");
+  const [locations, setLocations] = useState([]); // [] = all locations
+  const [categories, setCategories] = useState([]); // [] = all categories
   const [refreshSec, setRefreshSec] = useState(0);
 
   const [rows, setRows] = useState([]);
@@ -72,37 +78,73 @@ export default function App() {
     return () => controller.abort();
   }, [load]);
 
-  // Optional polling, handy while table B is filling up.
+  // Optional polling.
   useEffect(() => {
     if (!refreshSec) return undefined;
     const id = setInterval(() => load({ force: true, silent: true }), refreshSec * 1000);
     return () => clearInterval(id);
   }, [refreshSec, load]);
 
-  // Dropdown options come from the data that was fetched for the chosen range.
+  // Dropdown options come from the data fetched for the chosen range.
   const categoryOptions = useMemo(() => topCounts(rows, (r) => r.category, 50), [rows]);
   const locationOptions = useMemo(() => topCounts(rows, (r) => r.streets, 150), [rows]);
 
-  const effCategory = categoryOptions.some((o) => o.key === category) ? category : "all";
-  const effLocation = locationOptions.some((o) => o.key === location) ? location : "all";
+  // Drop selections that no longer exist in the freshly fetched range.
+  const effCategories = useMemo(
+    () => categories.filter((c) => categoryOptions.some((o) => o.key === c)),
+    [categories, categoryOptions]
+  );
+  const effLocations = useMemo(
+    () => locations.filter((l) => locationOptions.some((o) => o.key === l)),
+    [locations, locationOptions]
+  );
 
-  const byLocation = useMemo(
-    () => (effLocation === "all" ? rows : rows.filter((r) => r.streets.includes(effLocation))),
-    [rows, effLocation]
-  );
-  const byCategory = useMemo(
-    () => (effCategory === "all" ? rows : rows.filter((r) => r.category === effCategory)),
-    [rows, effCategory]
-  );
-  const filtered = useMemo(
-    () => (effCategory === "all" ? byLocation : byLocation.filter((r) => r.category === effCategory)),
-    [byLocation, effCategory]
-  );
+  const byLocation = useMemo(() => {
+    if (!effLocations.length) return rows;
+    const set = new Set(effLocations);
+    return rows.filter((r) => r.streets.some((s) => set.has(s)));
+  }, [rows, effLocations]);
+  const byCategory = useMemo(() => {
+    if (!effCategories.length) return rows;
+    const set = new Set(effCategories);
+    return rows.filter((r) => set.has(r.category));
+  }, [rows, effCategories]);
+  const filtered = useMemo(() => {
+    if (!effCategories.length) return byLocation;
+    const set = new Set(effCategories);
+    return byLocation.filter((r) => set.has(r.category));
+  }, [byLocation, effCategories]);
 
   const kpi = useMemo(() => computeKpis(filtered), [filtered]);
   const trend = useMemo(() => trendSeries(filtered), [filtered]);
   const hours = useMemo(() => hourSeries(filtered), [filtered]);
   const weekdays = useMemo(() => weekdaySeries(filtered), [filtered]);
+
+  // Comparison chart: one line per selected location (or category, if only categories are multi-selected).
+  const compareDim = effLocations.length > 1 ? "location" : effCategories.length > 1 ? "category" : null;
+  const compareAll = compareDim === "location" ? effLocations : compareDim === "category" ? effCategories : [];
+  const compareKeys = compareAll.slice(0, MAX_COMPARE);
+  const compareSig = compareKeys.join("|");
+
+  const compareColors = useMemo(
+    () => Object.fromEntries(compareKeys.map((k, i) => [k, SERIES_COLORS[i]])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [compareSig]
+  );
+  const compareGroups = useMemo(
+    () =>
+      compareKeys.map((k) => ({
+        key: k,
+        label: compareDim === "location" ? toTitle(k) : k,
+        match: compareDim === "location" ? (r) => r.streets.includes(k) : (r) => r.category === k,
+      })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [compareSig, compareDim]
+  );
+  const compareTrend = useMemo(
+    () => (compareDim ? trendSeries(filtered, compareGroups) : null),
+    [compareDim, filtered, compareGroups]
+  );
 
   // Cross-filtering: the category chart ignores the category filter (and the
   // location chart ignores the location filter) so you can still compare bars.
@@ -117,7 +159,7 @@ export default function App() {
 
   const newest = rows[0]?.date_time;
   const age = daysSince(newest);
-  const filtersActive = effLocation !== "all" || effCategory !== "all";
+  const filtersActive = effLocations.length > 0 || effCategories.length > 0;
   const peakHour = [...hours].sort((a, b) => b.count - a.count)[0];
 
   const kpiItems = [
@@ -154,9 +196,31 @@ export default function App() {
   ];
 
   const resetFilters = () => {
-    setLocation("all");
-    setCategory("all");
+    setLocations([]);
+    setCategories([]);
   };
+  const toggleIn = (setter) => (k) =>
+    setter((prev) => (prev.includes(k) ? prev.filter((x) => x !== k) : [...prev, k]));
+
+  const chipItems = [
+    ...effLocations.map((k) => ({
+      kind: "Location",
+      key: k,
+      label: toTitle(k),
+      color: compareDim === "location" ? compareColors[k] : null,
+    })),
+    ...effCategories.map((k) => ({
+      kind: "Category",
+      key: k,
+      label: k,
+      color: compareDim === "category" ? compareColors[k] : null,
+    })),
+  ];
+  const removeChip = (c) =>
+    (c.kind === "Location" ? setLocations : setCategories)((prev) => prev.filter((x) => x !== c.key));
+
+  const filterKey = `${range}|${effLocations.join("~")}|${effCategories.join("~")}`;
+  const csvName = `cambridge-incidents_${range}_${new Date().toISOString().slice(0, 10)}.csv`;
 
   return (
     <div className="page">
@@ -166,6 +230,7 @@ export default function App() {
           <a href="#overview">Overview</a>
           <a href="#trends">Trends</a>
           <a href="#breakdown">Breakdown</a>
+          <a href="#data">Data</a>
         </nav>
       </header>
 
@@ -189,28 +254,22 @@ export default function App() {
               ))}
             </select>
           </label>
-          <label>
-            <span>Location</span>
-            <select value={effLocation} onChange={(e) => setLocation(e.target.value)}>
-              <option value="all">All locations</option>
-              {locationOptions.map((o) => (
-                <option key={o.key} value={o.key}>
-                  {toTitle(o.key)} ({o.count})
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>Category</span>
-            <select value={effCategory} onChange={(e) => setCategory(e.target.value)}>
-              <option value="all">All categories</option>
-              {categoryOptions.map((o) => (
-                <option key={o.key} value={o.key}>
-                  {o.key} ({o.count})
-                </option>
-              ))}
-            </select>
-          </label>
+          <MultiSelect
+            label="Location"
+            noun="locations"
+            allLabel="All locations"
+            options={locationOptions.map((o) => ({ ...o, label: toTitle(o.key) }))}
+            selected={effLocations}
+            onChange={setLocations}
+          />
+          <MultiSelect
+            label="Category"
+            noun="categories"
+            allLabel="All categories"
+            options={categoryOptions.map((o) => ({ ...o, label: o.key }))}
+            selected={effCategories}
+            onChange={setCategories}
+          />
           <label>
             <span>Auto-refresh</span>
             <select value={refreshSec} onChange={(e) => setRefreshSec(Number(e.target.value))}>
@@ -233,12 +292,14 @@ export default function App() {
           </div>
         </section>
 
+        <FilterChips items={chipItems} onRemove={removeChip} onClear={resetFilters} />
+
         {error && (
           <div className="notice error" role="alert">
             <strong>Could not load data.</strong> {error}
             <div className="muted">
-              Check that the FastAPI server is running and that the endpoint paths in{" "}
-              <code>src/api.js</code> / <code>.env</code> match it.
+              Check that the backend is reachable and that the endpoint paths in <code>src/api.js</code> /{" "}
+              <code>.env</code> match it.
             </div>
           </div>
         )}
@@ -266,30 +327,49 @@ export default function App() {
               <TrendChart series={trend} total={filtered.length} />
             </section>
 
+            {compareDim && compareTrend && (
+              <section className="block">
+                <div className="block-head">
+                  <h2>Comparison by {compareDim}</h2>
+                  <span className="muted">{GRANULARITY_LABEL[compareTrend.granularity]}</span>
+                </div>
+                <CompareChart series={compareTrend} groups={compareGroups} colors={compareColors} />
+                <p className="caption">
+                  {compareDim === "location" &&
+                    "An incident at an intersection counts toward each selected street, so lines can add up to more than the total. "}
+                  {compareKeys.length < compareAll.length && `Showing the first ${MAX_COMPARE} selections.`}
+                </p>
+              </section>
+            )}
+
             <section id="breakdown">
               <div className="block pair">
                 <div>
                   <div className="block-head">
                     <h2>By category</h2>
-                    <span className="muted">Click a bar to filter</span>
+                    <span className="muted">Click bars to select several</span>
                   </div>
-                  <BarList
+                  <MultiBarList
                     data={categoryBars}
                     total={byLocation.length}
-                    selected={effCategory === "all" ? null : effCategory}
-                    onSelect={(k) => setCategory((c) => (c === k ? "all" : k))}
+                    selected={effCategories}
+                    colors={compareDim === "category" ? compareColors : {}}
+                    onToggle={toggleIn(setCategories)}
+                    caption="Bar length = incidents; % = share of the selected locations."
                   />
                 </div>
                 <div>
                   <div className="block-head">
                     <h2>Top locations</h2>
-                    <span className="muted">Click a bar to filter</span>
+                    <span className="muted">Click bars to select several</span>
                   </div>
-                  <BarList
+                  <MultiBarList
                     data={locationBars}
                     total={byCategory.length}
-                    selected={effLocation === "all" ? null : effLocation}
-                    onSelect={(k) => setLocation((l) => (l === k ? "all" : k))}
+                    selected={effLocations}
+                    colors={compareDim === "location" ? compareColors : {}}
+                    onToggle={toggleIn(setLocations)}
+                    caption="Bar length = incidents; % = share of the selected categories. Intersections count toward each street."
                   />
                 </div>
               </div>
@@ -309,6 +389,10 @@ export default function App() {
                   <ColumnChart data={weekdays} total={filtered.length} />
                 </div>
               </div>
+            </section>
+
+            <section id="data" className="block">
+              <DataTable rows={filtered} resetKey={filterKey} filename={csvName} />
             </section>
           </div>
         )}
