@@ -1,0 +1,318 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { RANGES, fetchRange } from "./api.js";
+import {
+  computeKpis,
+  daysSince,
+  enrich,
+  formatDate,
+  hourSeries,
+  pct,
+  toTitle,
+  topCounts,
+  trendSeries,
+  weekdaySeries,
+} from "./utils.js";
+import Kpis from "./components/Kpis.jsx";
+import { BarList, ColumnChart, TrendChart } from "./components/Charts.jsx";
+
+const CACHE_MS = 60_000;
+const REFRESH_OPTIONS = [
+  { value: 0, label: "Off" },
+  { value: 5, label: "Every 5 s" },
+  { value: 10, label: "Every 10 s" },
+  { value: 30, label: "Every 30 s" },
+  { value: 60, label: "Every 60 s" },
+];
+const GRANULARITY_LABEL = { day: "per day", week: "per week", month: "per month" };
+
+export default function App() {
+  const [range, setRange] = useState("all");
+  const [location, setLocation] = useState("all");
+  const [category, setCategory] = useState("all");
+  const [refreshSec, setRefreshSec] = useState(0);
+
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [updatedAt, setUpdatedAt] = useState(null);
+  const cache = useRef(new Map());
+
+  const rangeDef = RANGES.find((r) => r.value === range);
+
+  const load = useCallback(
+    async ({ force = false, silent = false, signal } = {}) => {
+      const hit = cache.current.get(range);
+      if (!force && hit && Date.now() - hit.at < CACHE_MS) {
+        setRows(hit.rows);
+        setUpdatedAt(new Date(hit.at));
+        setError(null);
+        setLoading(false);
+        return;
+      }
+      if (!silent) setLoading(true);
+      try {
+        const data = enrich(await fetchRange(rangeDef.path, signal));
+        cache.current.set(range, { rows: data, at: Date.now() });
+        setRows(data);
+        setUpdatedAt(new Date());
+        setError(null);
+      } catch (e) {
+        if (e.name === "AbortError") return;
+        setError(e.message);
+      }
+      if (!signal?.aborted && !silent) setLoading(false);
+    },
+    [range, rangeDef]
+  );
+
+  // Fetch whenever the range dropdown changes.
+  useEffect(() => {
+    const controller = new AbortController();
+    load({ signal: controller.signal });
+    return () => controller.abort();
+  }, [load]);
+
+  // Optional polling, handy while table B is filling up.
+  useEffect(() => {
+    if (!refreshSec) return undefined;
+    const id = setInterval(() => load({ force: true, silent: true }), refreshSec * 1000);
+    return () => clearInterval(id);
+  }, [refreshSec, load]);
+
+  // Dropdown options come from the data that was fetched for the chosen range.
+  const categoryOptions = useMemo(() => topCounts(rows, (r) => r.category, 50), [rows]);
+  const locationOptions = useMemo(() => topCounts(rows, (r) => r.streets, 150), [rows]);
+
+  const effCategory = categoryOptions.some((o) => o.key === category) ? category : "all";
+  const effLocation = locationOptions.some((o) => o.key === location) ? location : "all";
+
+  const byLocation = useMemo(
+    () => (effLocation === "all" ? rows : rows.filter((r) => r.streets.includes(effLocation))),
+    [rows, effLocation]
+  );
+  const byCategory = useMemo(
+    () => (effCategory === "all" ? rows : rows.filter((r) => r.category === effCategory)),
+    [rows, effCategory]
+  );
+  const filtered = useMemo(
+    () => (effCategory === "all" ? byLocation : byLocation.filter((r) => r.category === effCategory)),
+    [byLocation, effCategory]
+  );
+
+  const kpi = useMemo(() => computeKpis(filtered), [filtered]);
+  const trend = useMemo(() => trendSeries(filtered), [filtered]);
+  const hours = useMemo(() => hourSeries(filtered), [filtered]);
+  const weekdays = useMemo(() => weekdaySeries(filtered), [filtered]);
+
+  // Cross-filtering: the category chart ignores the category filter (and the
+  // location chart ignores the location filter) so you can still compare bars.
+  const categoryBars = useMemo(
+    () => topCounts(byLocation, (r) => r.category, 10).map((d) => ({ ...d, label: d.key })),
+    [byLocation]
+  );
+  const locationBars = useMemo(
+    () => topCounts(byCategory, (r) => r.streets, 10).map((d) => ({ ...d, label: toTitle(d.key) })),
+    [byCategory]
+  );
+
+  const newest = rows[0]?.date_time;
+  const age = daysSince(newest);
+  const filtersActive = effLocation !== "all" || effCategory !== "all";
+  const peakHour = [...hours].sort((a, b) => b.count - a.count)[0];
+
+  const kpiItems = [
+    {
+      label: "Incidents",
+      value: kpi.total.toLocaleString(),
+      sub: filtersActive ? `of ${rows.length.toLocaleString()} in range` : "in range",
+      tip: "Number of incidents that match the range, location and category you selected.",
+    },
+    {
+      label: "Arrests",
+      value: kpi.arrests.toLocaleString(),
+      sub: `${pct(kpi.arrests, kpi.total)}% of incidents`,
+      tip: "Records whose type is ARREST (for example warrant arrests).",
+    },
+    {
+      label: "Theft share",
+      value: `${pct(kpi.theft, kpi.total)}%`,
+      sub: `${kpi.theft.toLocaleString()} incidents`,
+      tip: "Shoplifting plus larceny, as a share of the selected incidents.",
+    },
+    {
+      label: "Violent share",
+      value: `${pct(kpi.violent, kpi.total)}%`,
+      sub: `${kpi.violent.toLocaleString()} incidents`,
+      tip: "Assault, assault and battery (A&B) and robbery, as a share of the selected incidents.",
+    },
+    {
+      label: "Data freshness",
+      value: age === null ? "–" : `${age} ${age === 1 ? "day" : "days"}`,
+      sub: newest ? `latest: ${formatDate(newest)}` : "no data",
+      tip: "Days between today and the newest record in the fetched range. A high number means the source feed is lagging.",
+    },
+  ];
+
+  const resetFilters = () => {
+    setLocation("all");
+    setCategory("all");
+  };
+
+  return (
+    <div className="page">
+      <header className="topnav">
+        <span className="brand">Cambridge Incidents</span>
+        <nav>
+          <a href="#overview">Overview</a>
+          <a href="#trends">Trends</a>
+          <a href="#breakdown">Breakdown</a>
+        </nav>
+      </header>
+
+      <main>
+        <section className="intro">
+          <h1>Incident overview</h1>
+          <p className="lede">
+            {rangeDef.label}
+            {updatedAt && <> · updated {updatedAt.toLocaleTimeString()}</>}
+          </p>
+        </section>
+
+        <section className="filters" aria-label="Filters">
+          <label>
+            <span>Time range</span>
+            <select value={range} onChange={(e) => setRange(e.target.value)}>
+              {RANGES.map((r) => (
+                <option key={r.value} value={r.value}>
+                  {r.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Location</span>
+            <select value={effLocation} onChange={(e) => setLocation(e.target.value)}>
+              <option value="all">All locations</option>
+              {locationOptions.map((o) => (
+                <option key={o.key} value={o.key}>
+                  {toTitle(o.key)} ({o.count})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Category</span>
+            <select value={effCategory} onChange={(e) => setCategory(e.target.value)}>
+              <option value="all">All categories</option>
+              {categoryOptions.map((o) => (
+                <option key={o.key} value={o.key}>
+                  {o.key} ({o.count})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Auto-refresh</span>
+            <select value={refreshSec} onChange={(e) => setRefreshSec(Number(e.target.value))}>
+              {REFRESH_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="filter-actions">
+            <button type="button" className="btn" onClick={() => load({ force: true })}>
+              Refresh
+            </button>
+            {filtersActive && (
+              <button type="button" className="btn" onClick={resetFilters}>
+                Clear
+              </button>
+            )}
+          </div>
+        </section>
+
+        {error && (
+          <div className="notice error" role="alert">
+            <strong>Could not load data.</strong> {error}
+            <div className="muted">
+              Check that the FastAPI server is running and that the endpoint paths in{" "}
+              <code>src/api.js</code> / <code>.env</code> match it.
+            </div>
+          </div>
+        )}
+
+        {loading && !rows.length && <p className="loading">Loading…</p>}
+
+        {!loading && !error && !rows.length && (
+          <div className="notice">
+            <strong>No records in this range.</strong> The dataset can lag behind today, so try a longer range
+            or “All data”.
+          </div>
+        )}
+
+        {rows.length > 0 && (
+          <div className={loading ? "content is-loading" : "content"}>
+            <section id="overview" className="block">
+              <Kpis items={kpiItems} />
+            </section>
+
+            <section id="trends" className="block">
+              <div className="block-head">
+                <h2>Incidents over time</h2>
+                <span className="muted">{GRANULARITY_LABEL[trend.granularity]}</span>
+              </div>
+              <TrendChart series={trend} total={filtered.length} />
+            </section>
+
+            <section id="breakdown">
+              <div className="block pair">
+                <div>
+                  <div className="block-head">
+                    <h2>By category</h2>
+                    <span className="muted">Click a bar to filter</span>
+                  </div>
+                  <BarList
+                    data={categoryBars}
+                    total={byLocation.length}
+                    selected={effCategory === "all" ? null : effCategory}
+                    onSelect={(k) => setCategory((c) => (c === k ? "all" : k))}
+                  />
+                </div>
+                <div>
+                  <div className="block-head">
+                    <h2>Top locations</h2>
+                    <span className="muted">Click a bar to filter</span>
+                  </div>
+                  <BarList
+                    data={locationBars}
+                    total={byCategory.length}
+                    selected={effLocation === "all" ? null : effLocation}
+                    onSelect={(k) => setLocation((l) => (l === k ? "all" : k))}
+                  />
+                </div>
+              </div>
+
+              <div className="block pair">
+                <div>
+                  <div className="block-head">
+                    <h2>Time of day</h2>
+                    {peakHour?.count > 0 && <span className="muted">peak {peakHour.full}</span>}
+                  </div>
+                  <ColumnChart data={hours} total={filtered.length} xInterval={2} />
+                </div>
+                <div>
+                  <div className="block-head">
+                    <h2>Day of week</h2>
+                  </div>
+                  <ColumnChart data={weekdays} total={filtered.length} />
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
